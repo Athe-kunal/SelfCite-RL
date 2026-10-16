@@ -218,3 +218,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Generated training data
+data/
+# Downloaded models and training runs
+models/
+runs/

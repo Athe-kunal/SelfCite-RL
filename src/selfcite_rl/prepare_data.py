@@ -8,16 +8,22 @@ Ported from `truncate_irrelevant` in SelfCite's
      reference answer cites (see `trim.py`).
   3. Write `{"prompt": <user text>, "metadata": {"chunks", "query"}}`.
 
+With `--eval_output`, a seeded random sample of `--num_eval` source rows
+goes to a held-out eval file instead of the train file.
+
 miles applies the chat template at load time (`--apply-chat-template`), and
 the reward rebuilds drop/keep prompts from `metadata["chunks"]`.
 
 Example:
-    python -m selfcite_rl.prepare_data --output data/selfcite_train.jsonl
+    python -m selfcite_rl.prepare_data --output data/selfcite_train.jsonl \
+        --eval_output data/selfcite_eval.jsonl --num_eval 100
 """
 
 import argparse
 from collections.abc import Callable
+import contextlib
 import json
+import random
 import re
 from typing import Any
 
@@ -107,7 +113,12 @@ def main() -> None:
     # 32,768 total context minus 8,192 response tokens.
     parser.add_argument("--max_prompt_tokens", type=int, default=24576)
     parser.add_argument("--num_examples", type=int, default=None)
+    parser.add_argument("--eval_output", default=None)
+    parser.add_argument("--num_eval", type=int, default=0)
+    parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
+    if args.num_eval and args.eval_output is None:
+        parser.error("--num_eval needs --eval_output")
 
     tokenizer = transformers.AutoTokenizer.from_pretrained(args.tokenizer)
 
@@ -128,8 +139,22 @@ def main() -> None:
     if args.num_examples is not None:
         rows = rows.select(range(min(args.num_examples, len(rows))))
 
-    num_written = 0
-    with open(args.output, "w", encoding="utf-8") as f:
+    eval_ids = set(
+        random.Random(args.seed).sample(
+            range(len(rows)), min(args.num_eval, len(rows))
+        )
+    )
+    counts = {"train": 0, "eval": 0}
+    with contextlib.ExitStack() as stack:
+        files = {
+            "train": stack.enter_context(
+                open(args.output, "w", encoding="utf-8")
+            )
+        }
+        if args.eval_output is not None:
+            files["eval"] = stack.enter_context(
+                open(args.eval_output, "w", encoding="utf-8")
+            )
         for idx, row in enumerate(tqdm.tqdm(rows, desc="Preparing")):
             example = build_example(
                 row, count_tokens, count_prompt_tokens, args.max_prompt_tokens
@@ -137,9 +162,13 @@ def main() -> None:
             if example is None:
                 continue
             example["metadata"]["idx"] = idx
-            f.write(json.dumps(example, ensure_ascii=False) + "\n")
-            num_written += 1
-    print(f"Wrote {num_written}/{len(rows)} examples to {args.output}")
+            split = "eval" if idx in eval_ids else "train"
+            files[split].write(json.dumps(example, ensure_ascii=False) + "\n")
+            counts[split] += 1
+    print(
+        f"Wrote {counts['train']} train / {counts['eval']} eval examples "
+        f"from {len(rows)} rows"
+    )
 
 
 if __name__ == "__main__":

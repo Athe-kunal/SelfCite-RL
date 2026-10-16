@@ -51,3 +51,26 @@ def test_parse_truncates_long_spans():
         answer, num_chunks=100, max_span_chunks=10
     )
     assert stmt.chunk_ids == frozenset(range(10))
+
+
+def test_parse_accepts_chunk_tag_style_ids():
+    # The prompt tags chunks as <C3>, so models often cite [C3] or [C3-C5].
+    answer = "<statement>A.<cite>[C1][3][C6-C7]</cite></statement>"
+    (stmt,) = citations.parse_statements(answer, num_chunks=10)
+    assert stmt.chunk_ids == frozenset({1, 3, 6, 7})
+
+
+def test_parse_ignores_contentless_statements():
+    # Copying the prompt's "<statement>{S}<cite>...</cite></statement>"
+    # template must not count as a cited statement.
+    answer = "<statement>{S}<cite>[C1]</cite></statement>"
+    assert citations.parse_statements(answer, num_chunks=5) == []
+
+
+def test_strip_think_drops_end_of_sequence_text():
+    # miles' response text ends with the literal EOS token; it must not be
+    # parsed as an uncited statement.
+    response = "<think>hmm</think>\n\n<statement>A.<cite>[0-0]</cite></statement><|im_end|>"
+    answer = citations.strip_think(response)
+    assert answer == "<statement>A.<cite>[0-0]</cite></statement>"
+    assert len(citations.parse_statements(answer, num_chunks=1)) == 1

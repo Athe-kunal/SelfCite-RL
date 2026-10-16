@@ -16,6 +16,8 @@
 #   TRAIN_MODE=full LR=1e-6 scripts/run_selfcite_grpo.sh train
 #
 # Outputs: runs/<RUN_NAME>/{checkpoints,tensorboard,train.log}
+#   LoRA checkpoints hold only the adapter (HF PEFT format under
+#   checkpoints/iter_*/adapter/); the base model is never re-saved.
 #   tensorboard --logdir runs/
 
 set -euo pipefail
@@ -28,19 +30,32 @@ STAGE="${1:-all}"
 
 # --- What to train -----------------------------------------------------------
 TRAIN_MODE="${TRAIN_MODE:-lora}"            # full | lora
-MODEL_NAME="${MODEL_NAME:-Qwen3-4B}"         # also the miles model-args name
+MODEL_NAME="${MODEL_NAME:-Qwen3-4B}"
+MILES_MODEL_TYPE="${MILES_MODEL_TYPE:-qwen3-4B}"  # third_party/miles/scripts/models/<this>.py
 HF_MODEL_ID="${HF_MODEL_ID:-Qwen/${MODEL_NAME}}"
 RUN_NAME="${RUN_NAME:-selfcite-${MODEL_NAME}-${TRAIN_MODE}-$(date +%Y%m%d-%H%M%S)}"
 
 # --- Hardware ----------------------------------------------------------------
-NUM_GPUS="${NUM_GPUS:-4}"
-TP_SIZE="${TP_SIZE:-2}"                      # tensor parallel
-CP_SIZE="${CP_SIZE:-2}"                      # context parallel (long prompts)
-MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-16384}"  # x CP_SIZE = per-sample cap
-SGLANG_MEM_FRACTION="${SGLANG_MEM_FRACTION:-0.7}"
+# Default: colocated. Every GPU runs SGLang during rollout (one data-parallel
+# engine per GPU, TP 1) and Megatron during training (data parallel =
+# TRAIN_GPUS / (TP x CP)); miles offloads whichever side is idle. Set
+# ROLLOUT_GPUS>0 to give SGLang its own GPUs instead.
+GPU_IDS="${GPU_IDS:-2,3}"                    # host GPUs given to the container
+TRAIN_GPUS="${TRAIN_GPUS:-2}"                # Megatron trainer
+ROLLOUT_GPUS="${ROLLOUT_GPUS:-0}"            # SGLang; 0 = colocate with trainer
+TP_SIZE="${TP_SIZE:-1}"                      # tensor parallel
+CP_SIZE="${CP_SIZE:-1}"                      # context parallel (long prompts)
+MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-32768}"  # x CP_SIZE = per-sample cap
+if (( ROLLOUT_GPUS == 0 )); then
+  SGLANG_MEM_FRACTION="${SGLANG_MEM_FRACTION:-0.7}"
+else
+  SGLANG_MEM_FRACTION="${SGLANG_MEM_FRACTION:-0.85}"
+fi
 
 # --- Data and lengths (32,768 total = Qwen3-4B native context) ----------------
-NUM_PREP_EXAMPLES="${NUM_PREP_EXAMPLES:-}"   # empty = all of LongCite-45k
+DATA_DIR="${DATA_DIR:-data}"
+NUM_PREP_EXAMPLES="${NUM_PREP_EXAMPLES:-2300}"  # first N rows; empty = all 45k
+NUM_EVAL="${NUM_EVAL:-100}"                  # of those, held out for eval
 MAX_PROMPT_TOKENS="${MAX_PROMPT_TOKENS:-24576}"
 MAX_RESPONSE_TOKENS="${MAX_RESPONSE_TOKENS:-8192}"
 
@@ -50,7 +65,16 @@ ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-8}"  # prompts per rollout
 N_SAMPLES_PER_PROMPT="${N_SAMPLES_PER_PROMPT:-8}"  # GRPO group size
 GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-64}"  # samples per optimizer step
 TEMPERATURE="${TEMPERATURE:-1.0}"
-SAVE_INTERVAL="${SAVE_INTERVAL:-20}"
+# Off-policy correction. The trainer always recomputes the old-policy
+# log-probs (an extra forward pass), so the PPO ratio is against its own
+# policy; TIS then reweights each token by min(pi_train / pi_sglang, TIS_CLIP)
+# to correct the SGLang-vs-Megatron numeric mismatch. Bitwise
+# --true-on-policy-mode needs FlashAttention 3 (Hopper), so not on A100.
+USE_TIS="${USE_TIS:-1}"
+TIS_CLIP="${TIS_CLIP:-2.0}"                  # upper bound on the IS weight
+SAVE_INTERVAL="${SAVE_INTERVAL:-20}"         # rollouts between adapter saves
+EVAL_INTERVAL="${EVAL_INTERVAL:-50}"         # rollouts between held-out evals
+DUMP_ROLLOUTS="${DUMP_ROLLOUTS:-1}"          # 1 = keep every sample in runs/<RUN>/rollouts/
 
 # --- Optimizer: LoRA usually wants a ~10x higher LR than full fine-tuning ---
 if [[ "${TRAIN_MODE}" == "lora" ]]; then
@@ -58,8 +82,8 @@ if [[ "${TRAIN_MODE}" == "lora" ]]; then
 else
   LR="${LR:-1e-6}"
 fi
-LORA_RANK="${LORA_RANK:-32}"
-LORA_ALPHA="${LORA_ALPHA:-32}"
+LORA_RANK="${LORA_RANK:-128}"
+LORA_ALPHA="${LORA_ALPHA:-${LORA_RANK}}"     # alpha / rank = 1
 
 # --- SelfCite reward (read by src/selfcite_rl/miles_reward.py) ----------------
 SELFCITE_UNCITED_PENALTY="${SELFCITE_UNCITED_PENALTY:--0.5}"
@@ -75,11 +99,12 @@ HF_CACHE="${HF_CACHE:-${HOME}/.cache/huggingface}"
 
 # Everything above, forwarded into the container.
 CONFIG_VARS=(
-  TRAIN_MODE MODEL_NAME HF_MODEL_ID RUN_NAME
-  NUM_GPUS TP_SIZE CP_SIZE MAX_TOKENS_PER_GPU SGLANG_MEM_FRACTION
-  NUM_PREP_EXAMPLES MAX_PROMPT_TOKENS MAX_RESPONSE_TOKENS
+  TRAIN_MODE MODEL_NAME MILES_MODEL_TYPE HF_MODEL_ID RUN_NAME
+  GPU_IDS TRAIN_GPUS ROLLOUT_GPUS TP_SIZE CP_SIZE MAX_TOKENS_PER_GPU
+  SGLANG_MEM_FRACTION DATA_DIR NUM_PREP_EXAMPLES NUM_EVAL
+  MAX_PROMPT_TOKENS MAX_RESPONSE_TOKENS
   NUM_ROLLOUT ROLLOUT_BATCH_SIZE N_SAMPLES_PER_PROMPT GLOBAL_BATCH_SIZE
-  TEMPERATURE SAVE_INTERVAL LR LORA_RANK LORA_ALPHA
+  TEMPERATURE USE_TIS TIS_CLIP SAVE_INTERVAL EVAL_INTERVAL DUMP_ROLLOUTS LR LORA_RANK LORA_ALPHA
   SELFCITE_UNCITED_PENALTY SELFCITE_MAX_SPANS SELFCITE_MAX_SPAN_CHUNKS
   SELFCITE_MAX_CONCURRENCY
 )
@@ -102,7 +127,7 @@ if [[ -z "${IN_MILES_CONTAINER:-}" ]]; then
   [[ -t 0 ]] && env_flags+=(-it)
   mkdir -p "${HF_CACHE}"
   exec docker run --rm \
-    --gpus all --ipc=host --shm-size=32g --network=host \
+    --gpus "\"device=${GPU_IDS}\"" --ipc=host --shm-size=32g --network=host \
     --ulimit memlock=-1 --ulimit stack=67108864 \
     -v "${REPO_HOST}:/workspace/SelfCite-RL" \
     -v "${HF_CACHE}:/root/.cache/huggingface" \
@@ -119,7 +144,9 @@ fi
 REPO=/workspace/SelfCite-RL
 MILES_DIR="${REPO}/third_party/miles"
 MODEL_PATH="${REPO}/models/${MODEL_NAME}"
-DATA_PATH="${REPO}/data/selfcite_train.jsonl"
+DATA_PATH="${REPO}/${DATA_DIR}/selfcite_train.jsonl"
+EVAL_DATA_PATH="${REPO}/${DATA_DIR}/selfcite_eval.jsonl"
+NUM_GPUS=$((TRAIN_GPUS + ROLLOUT_GPUS))
 RUN_DIR="${REPO}/runs/${RUN_NAME}"
 export PYTHONPATH="${REPO}/src:/root/Megatron-LM${PYTHONPATH:+:${PYTHONPATH}}"
 
@@ -140,9 +167,11 @@ print_summary() {
  run          ${RUN_NAME}  ->  runs/${RUN_NAME}
  model        ${HF_MODEL_ID}  (${TRAIN_MODE}$(
                 [[ "${TRAIN_MODE}" == lora ]] && echo ", rank ${LORA_RANK}, alpha ${LORA_ALPHA}"))
- data         data/selfcite_train.jsonl
+ data         ${DATA_DIR}/selfcite_{train,eval}.jsonl  (${NUM_PREP_EXAMPLES:-all} rows, ${NUM_EVAL} eval)
  lengths      prompt ${MAX_PROMPT_TOKENS} + response ${MAX_RESPONSE_TOKENS}
- gpus         ${NUM_GPUS} (colocated)  TP ${TP_SIZE}  CP ${CP_SIZE}
+ gpus         host ${GPU_IDS}: train ${TRAIN_GPUS}, rollout ${ROLLOUT_GPUS} (0 = colocated)  TP ${TP_SIZE}  CP ${CP_SIZE}
+ save / eval  every ${SAVE_INTERVAL} / ${EVAL_INTERVAL} rollouts
+ old logprobs trainer recompute$([[ "${USE_TIS}" == 1 ]] && echo " + TIS (clip ${TIS_CLIP})")
  grpo         ${NUM_ROLLOUT} rollouts x ${ROLLOUT_BATCH_SIZE} prompts x ${N_SAMPLES_PER_PROMPT} samples, global batch ${GLOBAL_BATCH_SIZE}, lr ${LR}
  reward       uncited ${SELFCITE_UNCITED_PENALTY}, max spans ${SELFCITE_MAX_SPANS}, max span chunks ${SELFCITE_MAX_SPAN_CHUNKS}
  miles        $(git -C "${MILES_DIR}" rev-parse --short HEAD 2>/dev/null || echo "?") (submodule)
@@ -156,11 +185,13 @@ prepare() {
     echo ">>> Downloading ${HF_MODEL_ID}"
     hf download "${HF_MODEL_ID}" --local-dir "${MODEL_PATH}"
   fi
-  if [[ ! -f "${DATA_PATH}" ]]; then
-    echo ">>> Building ${DATA_PATH}"
+  if [[ ! -f "${DATA_PATH}" || ! -f "${EVAL_DATA_PATH}" ]]; then
+    echo ">>> Building ${DATA_PATH} and ${EVAL_DATA_PATH}"
     mkdir -p "$(dirname "${DATA_PATH}")"
     python3 -m selfcite_rl.prepare_data \
       --output "${DATA_PATH}" \
+      --eval_output "${EVAL_DATA_PATH}" \
+      --num_eval "${NUM_EVAL}" \
       --tokenizer "${MODEL_PATH}" \
       --max_prompt_tokens "${MAX_PROMPT_TOKENS}" \
       ${NUM_PREP_EXAMPLES:+--num_examples "${NUM_PREP_EXAMPLES}"}
@@ -171,9 +202,14 @@ train() {
   mkdir -p "${RUN_DIR}"
   echo ">>> Installing miles from the submodule"
   pip install -q -e "${MILES_DIR}" --no-deps
+  # Transformer Engine prefers FlashAttention 4 whenever it is installed, but
+  # FA4's GQA kernels fail to compile on A100 and cuDNN fused attention rejects
+  # these inputs; without FA4, TE falls back to FA2, which works. (Container
+  # only; SGLang uses flashinfer and its own vendored kernels.)
+  pip uninstall -y -q flash-attn-4 >/dev/null 2>&1 || true
 
   local model_args
-  model_args="$(python3 "${MILES_DIR}/miles/utils/external_utils/model_args_utils.py" "${MODEL_NAME}")"
+  model_args="$(python3 "${MILES_DIR}/miles/utils/external_utils/model_args_utils.py" "${MILES_MODEL_TYPE}")"
   read -ra MODEL_ARGS <<< "${model_args}"
 
   CKPT_ARGS=(
@@ -190,6 +226,7 @@ train() {
       --lora-alpha "${LORA_ALPHA}"
       --lora-dropout 0.0
       --target-modules all-linear
+      --no-save-optim                # checkpoints hold the adapter only
     )
   elif [[ "${TRAIN_MODE}" != "full" ]]; then
     echo "TRAIN_MODE must be 'full' or 'lora', got '${TRAIN_MODE}'" >&2
@@ -213,6 +250,18 @@ train() {
     --balance-data
   )
 
+  # Held-out LongCite rows, scored with the same SelfCite reward, every
+  # EVAL_INTERVAL rollouts (and once before training). Qwen3's recommended
+  # thinking sampling.
+  EVAL_ARGS=(
+    --eval-interval "${EVAL_INTERVAL}"
+    --eval-prompt-data selfcite "${EVAL_DATA_PATH}"
+    --n-samples-per-eval-prompt 1
+    --eval-max-response-len "${MAX_RESPONSE_TOKENS}"
+    --eval-temperature 0.6
+    --eval-top-p 0.95
+  )
+
   GRPO_ARGS=(
     --advantage-estimator grpo
     --entropy-coef 0.0
@@ -220,6 +269,9 @@ train() {
     --eps-clip-high 0.28
     # No KL term: bridge mode has no Megatron-format reference checkpoint.
   )
+  if [[ "${USE_TIS}" == 1 ]]; then
+    GRPO_ARGS+=(--use-tis --tis-clip "${TIS_CLIP}")
+  fi
 
   OPTIMIZER_ARGS=(
     --optimizer adam
@@ -240,10 +292,26 @@ train() {
     --recompute-num-layers 1
     --use-dynamic-batch-size
     --max-tokens-per-gpu "${MAX_TOKENS_PER_GPU}"
+    --log-probs-chunk-size 4096
   )
 
+  if (( ROLLOUT_GPUS == 0 )); then
+    PLACEMENT_ARGS=(--colocate)
+    # Keep SGLang's base weights in CPU memory so only the LoRA adapter is
+    # re-synced after each onload.
+    if [[ "${TRAIN_MODE}" == lora ]]; then
+      PLACEMENT_ARGS+=(--lora-base-cpu-backup)
+    fi
+  else
+    PLACEMENT_ARGS=(--rollout-num-gpus "${ROLLOUT_GPUS}")
+  fi
+
   SGLANG_ARGS=(
-    --rollout-num-gpus-per-engine 1
+    --rollout-num-gpus-per-engine 1          # one engine per GPU = data parallel
+    # Each engine has its own radix (prefix) cache; cache-aware routing sends
+    # requests sharing a prompt (a GRPO group, its reward-scoring prefills) to
+    # the engine that already holds it.
+    --sglang-router-policy cache_aware
     --sglang-mem-fraction-static "${SGLANG_MEM_FRACTION}"
     --sglang-attention-backend flashinfer   # A100: no FlashAttention-3
   )
@@ -253,14 +321,18 @@ train() {
     --tb-project-name selfcite
     --tb-experiment-name "${RUN_NAME}"
     --custom-rollout-log-function-path selfcite_rl.miles_logging.log_rollout_data
+    --custom-eval-rollout-log-function-path selfcite_rl.miles_logging.log_eval_rollout_data
   )
+  if [[ "${DUMP_ROLLOUTS}" == 1 ]]; then
+    LOG_ARGS+=(--save-debug-rollout-data "${RUN_DIR}/rollouts/{rollout_id}.pt")
+  fi
 
   MISC_ARGS=(
     --attention-dropout 0.0
     --hidden-dropout 0.0
     --accumulate-allreduce-grads-in-fp32
     --attention-softmax-in-fp32
-    --attention-backend flash
+    --attention-backend flash        # FA2 (see the FA4 note in train())
   )
 
   local runtime_env
@@ -284,13 +356,14 @@ EOF
     --runtime-env-json="${runtime_env}" \
     -- python3 "${MILES_DIR}/train.py" \
     --actor-num-nodes 1 \
-    --actor-num-gpus-per-node "${NUM_GPUS}" \
+    --actor-num-gpus-per-node "${TRAIN_GPUS}" \
     --num-gpus-per-node "${NUM_GPUS}" \
-    --colocate \
+    "${PLACEMENT_ARGS[@]}" \
     "${MODEL_ARGS[@]}" \
     "${CKPT_ARGS[@]}" \
     "${MODE_ARGS[@]}" \
     "${ROLLOUT_ARGS[@]}" \
+    "${EVAL_ARGS[@]}" \
     "${GRPO_ARGS[@]}" \
     "${OPTIMIZER_ARGS[@]}" \
     "${PERF_ARGS[@]}" \

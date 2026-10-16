@@ -6,8 +6,10 @@ from selfcite_rl import citations
 from selfcite_rl import reward
 
 
-def _stmt(chunk_ids=(), has_cite_tag=True):
-    return citations.Statement("text", frozenset(chunk_ids), has_cite_tag, 0, 4)
+def _stmt(chunk_ids=(), has_cite_tag=True, text="text"):
+    return citations.Statement(
+        text, frozenset(chunk_ids), has_cite_tag, 0, len(text)
+    )
 
 
 def test_unfinished_thinking_gets_format_penalty():
@@ -58,3 +60,12 @@ def test_all_uncited_statements_score_the_penalty():
     )
     assert result.value == -0.5
     assert result.mean_cite_score is None
+
+
+def test_statements_are_weighted_by_length():
+    # A short cited statement cannot offset a long uncited answer.
+    stmts = [_stmt({0}, text="a" * 10), _stmt(text="b" * 90)]
+    result = reward.combine(
+        answer="...", statements=stmts, scores=[2.0, None], uncited_penalty=-0.5
+    )
+    assert result.value == (10 * 2.0 + 90 * -0.5) / 100

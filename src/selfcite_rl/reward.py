@@ -3,10 +3,14 @@
 Rules:
   * Format gate: if thinking never finished, or the answer has no
     `<statement>` tags, the reward is `FORMAT_PENALTY` (-1).
-  * Otherwise, the reward is the mean over all statements of:
+  * Otherwise, the reward is the mean over all statements, weighted by
+    statement length in characters, of:
       - the statement's `hold - drop` score if it cites something, or
       - `uncited_penalty` if it cites nothing, so leaving statements
         uncited is not a way to dodge scoring.
+    Length weighting stops one short cited statement from offsetting a long
+    answer left uncited (all text outside `<statement>` tags is a single
+    statement).
 
 This module is pure; `miles_reward.py` wires it into miles.
 """
@@ -62,8 +66,9 @@ def combine(
 
     cited = [score for score in scores if score is not None]
     values = [uncited_penalty if score is None else score for score in scores]
+    weights = [max(len(s.text.strip()), 1) for s in statements]
     return RewardResult(
-        value=sum(values) / len(values),
+        value=sum(w * v for w, v in zip(weights, values)) / sum(weights),
         format_ok=True,
         num_statements=len(statements),
         num_cited=len(cited),

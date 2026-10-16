@@ -2,12 +2,15 @@
 
 Ported from `postprocess` / `get_citations` in SelfCite's
 `make_data_get_prompt.py`. The model only writes chunk-id ranges such as
-`[3-5]`; this module turns each statement into its text plus the set of
+`[3-5]` (also accepted: `[3]`, `[C3]`, `[C3-C5]`); this module turns each statement into its text plus the set of
 chunk ids it cites, which is what the drop/hold reward needs.
 
 Rules kept from SelfCite:
   * Text outside `<statement>` tags longer than 5 characters counts as an
     uncited statement.
+  * Added here: a `<statement>` whose text is only a template placeholder
+    such as `{S}` is ignored, so copying the prompt's
+    `<statement>{S}<cite>...` template does not count as a cited statement.
   * Ranges that start past the last chunk or end before they start are
     dropped; ends are clamped to the last chunk.
   * Adjacent ranges are merged, then only the first 3 merged ranges are kept.
@@ -19,11 +22,16 @@ import dataclasses
 import re
 
 _THINK_END = "</think>"
+# Qwen end-of-turn / end-of-text tokens; miles keeps them in the response text.
+_END_TOKENS = ("<|im_end|>", "<|endoftext|>")
 _STATEMENT_OPEN = "<statement>"
 _STATEMENT_CLOSE = "</statement>"
 _CITE_RE = re.compile(r"<cite>(.*?)</cite>", re.DOTALL)
-_RANGE_RE = re.compile(r"\[(\d+)-(\d+)\]")
+# `[3-5]` is SelfCite's form; `[3]`, `[C3]` and `[C3-C5]` (after the prompt's
+# `<C3>` tags) name the same chunks, so they count too.
+_RANGE_RE = re.compile(r"\[C?(\d+)(?:-C?(\d+))?\]")
 _MIN_UNCITED_CHARS = 5
+_PLACEHOLDER_RE = re.compile(r"\{\w*\}")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -45,22 +53,31 @@ class Statement:
     end: int
 
 
+def _strip_end_tokens(text: str) -> str:
+    text = text.strip()
+    while text.endswith(_END_TOKENS):
+        for token in _END_TOKENS:
+            text = text.removesuffix(token).strip()
+    return text
+
+
 def strip_think(response: str) -> str | None:
-    """Removes a leading `<think>...</think>` block from a response.
+    """Removes a leading `<think>...</think>` block and trailing EOS text.
 
     Args:
         response: The raw model response.
 
     Returns:
-        The answer after the think block, stripped. The response unchanged
-        (stripped) if it has no think block. `None` if thinking never
-        finished, e.g. the response hit the length limit.
+        The answer after the think block, stripped and without trailing
+        end-of-sequence tokens. The response itself (cleaned the same way) if
+        it has no think block. `None` if thinking never finished, e.g. the
+        response hit the length limit.
     """
     if _THINK_END in response:
-        return response.rsplit(_THINK_END, 1)[1].strip()
+        return _strip_end_tokens(response.rsplit(_THINK_END, 1)[1])
     if "<think>" in response:
         return None
-    return response.strip()
+    return _strip_end_tokens(response)
 
 
 def _parse_chunk_ids(
@@ -69,7 +86,8 @@ def _parse_chunk_ids(
     """Turns `[s-e][s-e]...` into chunk ids using SelfCite's rules."""
     merged: list[list[int]] = []
     for match in _RANGE_RE.finditer(cite_text):
-        start, end = int(match.group(1)), int(match.group(2))
+        start = int(match.group(1))
+        end = int(match.group(2) or start)
         if start > num_chunks - 1 or end < start:
             continue
         end = min(end, num_chunks - 1, start + max_span_chunks - 1)
@@ -121,7 +139,7 @@ def parse_statements(
         cite = _CITE_RE.search(body)
         text_end = body_start + (cite.start() if cite else len(body))
         text = answer[body_start:text_end]
-        if text.strip():
+        if text.strip() and not _PLACEHOLDER_RE.fullmatch(text.strip()):
             chunk_ids = frozenset()
             if cite:
                 chunk_ids = _parse_chunk_ids(

@@ -38,3 +38,9 @@ def test_build_prompt_matches_selfcite_template():
     assert prompt.endswith(
         "[Document Start]\n<C0>a.\n[Document End]\n\nWhat is a?"
     )
+
+
+def test_prompt_shows_a_per_sentence_example():
+    prompt = chunking.build_prompt(["A."], "Q?")
+    assert "For example:" in prompt
+    assert prompt.count("<statement>") >= 3  # the template plus the example

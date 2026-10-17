@@ -7,6 +7,10 @@ and each chunk is prefixed with `<C{i}>` so the model can cite it as `[i-j]`.
 The `keep` argument lets the reward rebuild the same prompt with only some
 chunks present, which is how SelfCite's context ablation works: chunk ids
 stay the original ones even when other chunks are removed.
+
+Added here: the prompt ends its instructions with a short example of the
+format. SelfCite started from LongCite-8B, already fine-tuned on this format;
+a base model has only the instruction's `{S}` placeholder to go on.
 """
 
 from collections.abc import Container, Sequence
@@ -22,7 +26,10 @@ PROMPT_TEMPLATE = (
     "in the document (i.e., <C{s1}>-<C_{e1}>, <C{s2}>-<C{e2}>, ...), please "
     "append these chunk numbers to S in the format "
     '"<statement>{S}<cite>[{s1}-{e1}][{s2}-{e2}]...</cite></statement>". '
-    "You must answer in the same language as the user's question."
+    "You must answer in the same language as the user's question. "
+    "For example: <statement>The bridge opened in 1932.<cite>[3-3]</cite>"
+    "</statement><statement>It carries six lanes of traffic.<cite>[7-8]"
+    "[12-12]</cite></statement>"
     "\n\n[Document Start]\n%s\n[Document End]\n\n%s"
 )
 

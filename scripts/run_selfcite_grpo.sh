@@ -75,6 +75,9 @@ TIS_CLIP="${TIS_CLIP:-2.0}"                  # upper bound on the IS weight
 SAVE_INTERVAL="${SAVE_INTERVAL:-20}"         # rollouts between adapter saves
 EVAL_INTERVAL="${EVAL_INTERVAL:-50}"         # rollouts between held-out evals
 DUMP_ROLLOUTS="${DUMP_ROLLOUTS:-1}"          # 1 = keep every sample in runs/<RUN>/rollouts/
+# Extra miles flags appended verbatim, e.g. "--debug-rollout-only" to only
+# generate and score rollouts (no training).
+EXTRA_MILES_ARGS="${EXTRA_MILES_ARGS:-}"
 
 # --- Optimizer: LoRA usually wants a ~10x higher LR than full fine-tuning ---
 if [[ "${TRAIN_MODE}" == "lora" ]]; then
@@ -104,7 +107,8 @@ CONFIG_VARS=(
   SGLANG_MEM_FRACTION DATA_DIR NUM_PREP_EXAMPLES NUM_EVAL
   MAX_PROMPT_TOKENS MAX_RESPONSE_TOKENS
   NUM_ROLLOUT ROLLOUT_BATCH_SIZE N_SAMPLES_PER_PROMPT GLOBAL_BATCH_SIZE
-  TEMPERATURE USE_TIS TIS_CLIP SAVE_INTERVAL EVAL_INTERVAL DUMP_ROLLOUTS LR LORA_RANK LORA_ALPHA
+  TEMPERATURE USE_TIS TIS_CLIP SAVE_INTERVAL EVAL_INTERVAL DUMP_ROLLOUTS
+  EXTRA_MILES_ARGS LR LORA_RANK LORA_ALPHA
   SELFCITE_UNCITED_PENALTY SELFCITE_MAX_SPANS SELFCITE_MAX_SPAN_CHUNKS
   SELFCITE_MAX_CONCURRENCY
 )
@@ -348,6 +352,9 @@ print(json.dumps({"env_vars": env}))
 EOF
 )"
 
+  local -a EXTRA_ARGS=()
+  read -ra EXTRA_ARGS <<< "${EXTRA_MILES_ARGS}"
+
   ray stop --force >/dev/null 2>&1 || true
   ray start --head --num-gpus "${NUM_GPUS}" --disable-usage-stats >/dev/null
 
@@ -370,6 +377,7 @@ EOF
     "${SGLANG_ARGS[@]}" \
     "${LOG_ARGS[@]}" \
     "${MISC_ARGS[@]}" \
+    "${EXTRA_ARGS[@]}" \
     2>&1 | tee "${RUN_DIR}/train.log"
 }
 

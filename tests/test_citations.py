@@ -74,3 +74,13 @@ def test_strip_think_drops_end_of_sequence_text():
     answer = citations.strip_think(response)
     assert answer == "<statement>A.<cite>[0-0]</cite></statement>"
     assert len(citations.parse_statements(answer, num_chunks=1)) == 1
+
+
+def test_parse_caps_spans_after_merging_adjacent_ranges():
+    # Chaining small adjacent ranges must not dodge max_span_chunks.
+    chain = "".join(f"[{i}-{i}]" for i in range(40))
+    answer = f"<statement>X long.<cite>{chain}</cite></statement>"
+    (stmt,) = citations.parse_statements(
+        answer, num_chunks=100, max_span_chunks=10
+    )
+    assert stmt.chunk_ids == frozenset(range(10))

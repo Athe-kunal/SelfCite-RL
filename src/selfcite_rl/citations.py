@@ -14,8 +14,9 @@ Rules kept from SelfCite:
   * Ranges that start past the last chunk or end before they start are
     dropped; ends are clamped to the last chunk.
   * Adjacent ranges are merged, then only the first 3 merged ranges are kept.
-  * A range longer than `max_span_chunks` is truncated (SelfCite's length
-    balancing used 10).
+  * Added here: a merged range longer than `max_span_chunks` is truncated
+    (SelfCite's length balancing used 10). The cap applies after merging, so
+    chaining adjacent ranges cannot get around it.
 """
 
 import dataclasses
@@ -90,14 +91,15 @@ def _parse_chunk_ids(
         end = int(match.group(2) or start)
         if start > num_chunks - 1 or end < start:
             continue
-        end = min(end, num_chunks - 1, start + max_span_chunks - 1)
+        end = min(end, num_chunks - 1)
         if merged and start == merged[-1][1] + 1:
             merged[-1][1] = end
         else:
             merged.append([start, end])
     ids = set()
     for start, end in merged[:max_spans]:
-        ids.update(range(start, end + 1))
+        # Cap after merging, so chaining [1-1][2-2][3-3]... cannot dodge it.
+        ids.update(range(start, min(end, start + max_span_chunks - 1) + 1))
     return frozenset(ids)
 
 

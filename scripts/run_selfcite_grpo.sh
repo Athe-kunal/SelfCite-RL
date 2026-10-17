@@ -72,8 +72,8 @@ TEMPERATURE="${TEMPERATURE:-1.0}"
 # --true-on-policy-mode needs FlashAttention 3 (Hopper), so not on A100.
 USE_TIS="${USE_TIS:-1}"
 TIS_CLIP="${TIS_CLIP:-2.0}"                  # upper bound on the IS weight
-SAVE_INTERVAL="${SAVE_INTERVAL:-20}"         # rollouts between adapter saves
 EVAL_INTERVAL="${EVAL_INTERVAL:-50}"         # rollouts between held-out evals
+SAVE_INTERVAL="${SAVE_INTERVAL:-${EVAL_INTERVAL}}"  # save at every eval
 DUMP_ROLLOUTS="${DUMP_ROLLOUTS:-1}"          # 1 = keep every sample in runs/<RUN>/rollouts/
 # Extra miles flags appended verbatim, e.g. "--debug-rollout-only" to only
 # generate and score rollouts (no training).
